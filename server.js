@@ -9,12 +9,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Baza podataka
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 const client = new DynamoDBClient({ region: "eu-central-1" });
 const docClient = DynamoDBDocumentClient.from(client);
 const TABLE_NAME = "Usput";
 
-// Sustav za red čekanja
 class TaskQueue {
     constructor(concurrency) {
         this.concurrency = concurrency;
@@ -61,7 +61,6 @@ app.post('/api/list-volume', async (req, res) => {
         console.log('\n--- NOVI ZAHTJEV ---', listUrl);
         const urlObj = new URL(listUrl);
 
-        // 1. Čupanje osnovnih proizvoda iz linka
         if (listUrl.includes('/receive-share/')) {
             const pathSegments = urlObj.pathname.split('/');
             const shareIndex = pathSegments.indexOf('receive-share');
@@ -70,13 +69,12 @@ app.post('/api/list-volume', async (req, res) => {
                 if (itemsSegment && itemsSegment.includes(':')) {
                     itemsSegment.split(',').forEach((item) => {
                         const [code, qty] = item.split(':');
-                        itemsMap.set(code, { code, name: `Učitavam...`, quantity: parseInt(qty, 10) || 1, dimensions: null, isDesignPart: false });
+                        itemsMap.set(code, { code, name: `Učitavam...`, quantity: parseInt(qty, 10) || 1, dimensions: null, price: 0, image: '', isDesignPart: false });
                     });
                 }
             }
         }
 
-        // 2. Detekcija dizajna
         const generatedDesigns = [];
         const designsParam = urlObj.searchParams.get('designs');
         if (designsParam) {
@@ -87,13 +85,11 @@ app.post('/api/list-volume', async (req, res) => {
                 const currentDesignQty = parseInt(parts[2], 10) || 1;
 
                 if (PLANNER_URLS[familyUpper]) {
-                    // ODMAH PRUŽAMO INFORMACIJU DA JE DETEKTIRANO
                     console.log(`[Informacija] Dizajn detektiran! Obitelj: ${familyUpper}, Šifra dizajna: ${designId}`);
-
                     generatedDesigns.push({
                         family: familyUpper,
                         code: designId,
-                        link: PLANNER_URLS[familyUpper], // Idemo na čisti planer
+                        link: PLANNER_URLS[familyUpper],
                         qty: currentDesignQty
                     });
                 }
@@ -102,7 +98,7 @@ app.post('/api/list-volume', async (req, res) => {
 
         await browserQueue.add(async () => {
             let browser = await puppeteer.launch({
-                headless: 'new',
+                headless: false,
                 args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1280,800']
             });
 
@@ -111,9 +107,9 @@ app.post('/api/list-volume', async (req, res) => {
                 await page.setViewport({ width: 1280, height: 800 });
                 await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
 
-                console.log(`[Glavna stranica] Učitavam i skeniram obične artikle...`);
+                console.log(`[Glavna stranica] Skeniram obične artikle...`);
                 await page.goto(listUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-                await new Promise(r => setTimeout(r, 3000));
+                await delay(3000);
 
                 const scrapedListItems = await page.evaluate(() => {
                     const results = [];
@@ -130,185 +126,320 @@ app.post('/api/list-volume', async (req, res) => {
 
                 for (const item of scrapedListItems) {
                     if (!itemsMap.has(item.code)) {
-                        itemsMap.set(item.code, { code: item.code, name: 'Učitavam...', quantity: item.quantity, dimensions: null, isDesignPart: false });
+                        itemsMap.set(item.code, { code: item.code, name: 'Učitavam...', quantity: item.quantity, dimensions: null, price: 0, image: '', isDesignPart: false });
                     }
                 }
 
-                // 3. LJUDSKI WORKFLOW ZA DIZAJNERA
                 if (generatedDesigns.length > 0) {
                     for (const design of generatedDesigns) {
+                        let networkCaughtItems = [];
+
+                        const responseHandler = async (res) => {
+                            const req = res.request();
+                            if (req.resourceType() === 'fetch' || req.resourceType() === 'xhr') {
+                                try {
+                                    const json = await res.json();
+                                    const extractCodes = (obj) => {
+                                        if (!obj || typeof obj !== 'object') return;
+                                        const code = obj.articleNumber || obj.itemNo || obj.articleNo || obj.itemNumber || obj.partNumber || obj.id || obj.articleCode || obj.productId;
+                                        const qty = obj.quantity !== undefined ? obj.quantity : (obj.qty !== undefined ? obj.qty : obj.count);
+
+                                        if (code !== undefined && qty !== undefined) {
+                                            const cleanCode = String(code).replace(/\D/g, '');
+                                            if (cleanCode.length >= 6 && cleanCode.length <= 10) {
+                                                networkCaughtItems.push({ code: cleanCode, quantity: parseInt(qty, 10) || 1 });
+                                            }
+                                        }
+                                        for (const key in obj) {
+                                            if (Object.prototype.hasOwnProperty.call(obj, key)) extractCodes(obj[key]);
+                                        }
+                                    };
+                                    extractCodes(json);
+                                } catch (e) {}
+                            }
+                        };
+
+                        page.on('response', responseHandler);
+
                         try {
-                            console.log(`[Dizajner - Korak 1] Otvaram IKEA planer za kod ${design.code}...`);
-
-                            // A) Otvori prazan planer
+                            console.log(`[Dizajner - Korak 1] Otvaram IKEA planer...`);
                             await page.goto(design.link, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-                            await new Promise(r => setTimeout(r, 6000));
+                            await delay(6000);
 
-                            // Mičemo kolačiće da nam ne blokiraju klikove
+                            console.log(`[Dizajner] Rješavam kolačiće...`);
                             await page.evaluate(() => {
                                 const cookieBtn = document.querySelector('#onetrust-accept-btn-handler');
                                 if (cookieBtn) cookieBtn.click();
                             });
-                            await new Promise(r => setTimeout(r, 1000));
+                            await delay(1500);
 
-                            // B) Klikni na "Otvori šifru dizajna" i upiši kod
-                            console.log(`[Dizajner - Korak 2] Upisujem šifru dizajna...`);
+                            console.log(`[Dizajner - Korak 2] Otvaram Izbornik (Menu)...`);
                             await page.evaluate(() => {
-                                const btns = Array.from(document.querySelectorAll('button, span'));
-                                const openBtn = btns.find(b => b.innerText && (b.innerText.toLowerCase().includes('šifr') || b.innerText.toLowerCase().includes('otvori')));
-                                if (openBtn) openBtn.click();
+                                const menuHost = document.querySelector('[data-element-name="kompis-menu"]');
+                                if (menuHost && menuHost.shadowRoot) {
+                                    const shadowBtn = menuHost.shadowRoot.querySelector('[data-element-name="skapa-icon-button"]');
+                                    if (shadowBtn) {
+                                        const innerBtn = shadowBtn.shadowRoot?.querySelector('button');
+                                        if (innerBtn) innerBtn.click();
+                                        else shadowBtn.click();
+                                    }
+                                }
                             });
-                            await new Promise(r => setTimeout(r, 1500));
+                            await delay(2000);
 
-                            const inputs = await page.$$('input[type="text"]');
-                            if (inputs.length > 0) {
-                                await inputs[0].click({ clickCount: 3 });
-                                await inputs[0].type(design.code, { delay: 100 });
-                                await page.keyboard.press('Enter');
+                            console.log(`[Dizajner - Korak 3] Klikam "Otvori šifru dizajna"...`);
+                            await page.evaluate(() => {
+                                const menuCard = document.querySelector('[data-element-name="kompis-menu-card"]');
+                                if (menuCard && menuCard.shadowRoot) {
+                                    const targetBtn = menuCard.shadowRoot.getElementById('openDesignCodeButtonClick');
+                                    if (targetBtn) targetBtn.click();
+                                }
+                            });
+                            await delay(2500);
 
-                                // Klikni gumb za potvrdu ako postoji
-                                await page.evaluate(() => {
-                                    const btns = Array.from(document.querySelectorAll('button'));
-                                    const confirmBtn = btns.find(b => b.innerText && b.innerText.toLowerCase().includes('otvori'));
-                                    if (confirmBtn) confirmBtn.click();
+                            console.log(`[Dizajner - Korak 4] Unosim kod dizajna: ${design.code}...`);
+                            try {
+                                const inputFound = await page.evaluate(() => {
+                                    const card = document.querySelector('[data-element-name="kompis-open-design-card"]');
+                                    if (!card || !card.shadowRoot) return false;
+                                    const inputContainer = card.shadowRoot.querySelector('[data-element-name="kompis-open-design-code-input"]');
+                                    if (!inputContainer || !inputContainer.shadowRoot) return false;
+                                    const input = inputContainer.shadowRoot.getElementById('open-design-code-input-input');
+                                    if (!input) return false;
+                                    input.focus(); input.click();
+                                    return true;
                                 });
-                            }
 
-                            console.log(`[Dizajner - Korak 3] Čekam da se učita 3D dizajn...`);
-                            await new Promise(r => setTimeout(r, 8000));
-
-                            // C) Klikni na "Sažetak"
-                            console.log(`[Dizajner - Korak 4] Klikam na Sažetak...`);
-                            await page.evaluate(() => {
-                                const btns = Array.from(document.querySelectorAll('button, span'));
-                                const summaryBtn = btns.find(b => b.innerText && b.innerText.toLowerCase().includes('sažetak'));
-                                if (summaryBtn) summaryBtn.click();
-                            });
-                            await new Promise(r => setTimeout(r, 3000));
-
-                            // D) Odbijanje ručki (upitnik) - Klikni "Ne"
-                            console.log(`[Dizajner - Korak 5] Rješavam upitnik (Ručke -> Ne)...`);
-                            await page.evaluate(() => {
-                                const btns = Array.from(document.querySelectorAll('button, span'));
-                                const noBtn = btns.find(b => b.innerText && (b.innerText.toLowerCase() === 'ne' || b.innerText.toLowerCase().includes('bez') || b.innerText.toLowerCase().includes('preskoči')));
-                                if (noBtn) noBtn.click();
-                            });
-
-                            // E) Čekanje učitavanja Sažetak stranice
-                            console.log(`[Dizajner - Korak 6] Otvaram stranicu sažetka s popisom...`);
-                            await new Promise(r => setTimeout(r, 5000));
-
-                            // SIGURNOSNI FALLBACK: Ako klikanje nije uspjelo (URL nije prešao na #/summary), forsiraj direktni URL!
-                            if (!page.url().includes('summary')) {
-                                console.log('[Dizajner - Sigurnost] Klikanje je zapelo, preskačem direktno na /summary URL...');
-                                const summaryUrl = design.link.replace('/planner', '/summary') + '?vpc=' + design.code;
-                                await page.goto(summaryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-                                await new Promise(r => setTimeout(r, 6000));
-                            }
-
-                            // F) Skeniranje vidljivog teksta za artiklima (sada kad je sažetak otvoren)
-                            const plannerCodes = await page.evaluate(() => {
-                                const codes = [];
-                                const allText = document.body.innerText || '';
-                                const matches = [...allText.matchAll(/\b(\d{3}\.\d{3}\.\d{2})\b/g)];
-                                matches.forEach(m => {
-                                    codes.push(m[1].replace(/\./g, ''));
-                                });
-                                return [...new Set(codes)];
-                            });
-
-                            console.log(`[Dizajner - Gotovo] Pronađeno ${plannerCodes.length} artikala u dizajnu.`);
-
-                            // Dodavanje u mapu
-                            plannerCodes.forEach(code => {
-                                if (itemsMap.has(code)) {
-                                    itemsMap.get(code).quantity += design.qty;
-                                } else {
-                                    itemsMap.set(code, {
-                                        code: code,
-                                        name: 'Dio dizajna',
-                                        quantity: design.qty,
-                                        dimensions: null,
-                                        isDesignPart: true
+                                if (inputFound) {
+                                    await page.keyboard.type(design.code, { delay: 150 });
+                                    await delay(1000);
+                                    await page.keyboard.press('Enter');
+                                    await delay(1500);
+                                    await page.evaluate(() => {
+                                        const card = document.querySelector('[data-element-name="kompis-open-design-card"]');
+                                        if (card && card.shadowRoot) {
+                                            const openBtn = card.shadowRoot.querySelector('[data-element-name="skapa-button"][a11y-label="Otvori"], [data-element-name="skapa-button"] [aria-label="Otvori"]');
+                                            if (openBtn) {
+                                                openBtn.click();
+                                                if (openBtn.shadowRoot) {
+                                                    const innerBtn = openBtn.shadowRoot.querySelector('button');
+                                                    if (innerBtn) innerBtn.click();
+                                                }
+                                            }
+                                        }
                                     });
+                                }
+                            } catch (e) {}
+
+                            console.log(`[Dizajner - Korak 5] Čekam učitavanje 3D prikaza...`);
+                            await delay(6000);
+
+                            console.log(`[Dizajner - Korak 6] Klikam na Sažetak...`);
+                            await page.evaluate(() => {
+                                const header = document.querySelector('[data-element-name="kompis-planning-header"]');
+                                if (header && header.shadowRoot) {
+                                    const summaryComponent = header.shadowRoot.querySelector('[data-element-name="kompis-mini-configuration-summary"]');
+                                    if (summaryComponent && summaryComponent.shadowRoot) {
+                                        const summaryBtn = summaryComponent.shadowRoot.querySelector('[data-testid="configurationSummaryPrimaryButton"]');
+                                        if (summaryBtn) {
+                                            summaryBtn.click();
+                                            if (summaryBtn.shadowRoot) {
+                                                const innerBtn = summaryBtn.shadowRoot.querySelector('button');
+                                                if (innerBtn) innerBtn.click();
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            await delay(4000);
+
+                            console.log(`[Dizajner - Korak 7] Preskačem upitnik za ručke...`);
+                            for (let i = 0; i < 2; i++) {
+                                if (page.url().includes('summary')) break;
+                                await page.evaluate(() => {
+                                    const btns = Array.from(document.querySelectorAll('button, [data-element-name="skapa-button"]'));
+                                    const skipBtn = btns.find(b => b.textContent && (b.textContent.toLowerCase() === 'ne' || b.textContent.toLowerCase().includes('bez') || b.textContent.toLowerCase().includes('preskoči')));
+                                    if (skipBtn) skipBtn.click();
+                                });
+                                await delay(2000);
+                            }
+
+                            console.log(`[Dizajner - Korak 8] Skupljam mrežne podatke...`);
+                            await delay(3000);
+                            page.off('response', responseHandler);
+
+                            console.log(`[Dizajner - Gotovo] Ulovljeno ${networkCaughtItems.length} stavki.`);
+                            networkCaughtItems.forEach(item => {
+                                const finalQty = item.quantity * design.qty;
+                                if (itemsMap.has(item.code)) {
+                                    itemsMap.get(item.code).quantity += finalQty;
+                                } else {
+                                    itemsMap.set(item.code, { code: item.code, name: 'Dio dizajna', quantity: finalQty, dimensions: null, price: 0, image: '', isDesignPart: true });
                                 }
                             });
 
                         } catch (plannerErr) {
-                            console.error(`[Dizajner] Greška pri prolasku kroz UI: ${plannerErr.message}`);
+                            page.off('response', responseHandler);
+                            console.error(`[Dizajner] Greška: ${plannerErr.message}`);
                         }
                     }
                 }
 
-                // 4. BAZA PODATAKA ILI SCRAPANJE STANDARDNIM NAČINOM
-                const allCodes = Array.from(itemsMap.values()).map(i => i.code);
+                const ArrayCodes = Array.from(itemsMap.values()).map(i => i.code);
                 const missingCodesToFetch = [];
                 const fetchedDetails = {};
 
-                for (const code of allCodes) {
+                for (const code of ArrayCodes) {
                     try {
                         const dbResponse = await docClient.send(new GetCommand({ TableName: TABLE_NAME, Key: { PK: `ARTICLE#${code}`, SK: 'INFO' } }));
-                        if (dbResponse.Item && dbResponse.Item.name) {
-                            // Uzimamo iz baze
+                        if (dbResponse.Item && dbResponse.Item.name && dbResponse.Item.dimensions) {
                             fetchedDetails[code] = dbResponse.Item;
                         } else {
-                            // Šaljemo na scrape listu
                             missingCodesToFetch.push(code);
                         }
                     } catch (e) { missingCodesToFetch.push(code); }
                 }
 
-                // Scrape-aj standardnim načinom ako nije u bazi
                 if (missingCodesToFetch.length > 0) {
-                    console.log(`[Server] Skidam podatke za ${missingCodesToFetch.length} novih komada s weba...`);
+                    console.log(`[Server] Direktno povlačim podatke, cijene i slike za ${missingCodesToFetch.length} novih komada...`);
                     for (const code of missingCodesToFetch) {
                         try {
                             const response = await fetch(`https://www.ikea.com/hr/hr/p/-${code}/`, {
-                                headers: { 'User-Agent': 'Mozilla/5.0' }
+                                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
                             });
 
                             if (response.ok) {
                                 const htmlText = await response.text();
-                                const titleMatch = htmlText.match(/<title>([^<]+)<\/title>/i);
-                                let pageTitle = titleMatch ? titleMatch[1].replace(/- IKEA/i, '').trim().split(',')[0].trim() : '';
 
+                                let itemPrice = 0;
+                                let pageTitle = '';
                                 let width = 0, height = 0, length = 0, weight = 0;
-                                const wMatch = htmlText.match(/Širina:\s*(\d+)\s*cm/i);
-                                const hMatch = htmlText.match(/Visina:\s*(\d+)\s*cm/i);
-                                const lMatch = htmlText.match(/Duljina:\s*(\d+)\s*cm/i);
-                                const wtMatch = htmlText.match(/Težina:\s*([\d,.]+)\s*kg/i);
+                                let imageUrl = '';
 
-                                if (lMatch) length = parseInt(lMatch[1], 10);
-                                if (wMatch) width = parseInt(wMatch[1], 10);
-                                if (hMatch) height = parseInt(hMatch[1], 10);
-                                if (wtMatch) weight = parseFloat(wtMatch[1].replace(',', '.'));
+                                const hydrateMatches = htmlText.match(/<script[^>]*type="text\/hydrate"[^>]*>([\s\S]*?)<\/script>/g);
 
-                                if (!length && width) length = width;
-                                const dims = (width > 0 || length > 0 || weight > 0) ? { width, height, length, weight } : null;
+                                if (hydrateMatches) {
+                                    // Prolazi kroz SVE JSON blokove dok ne prikupi sve potrebne podatke
+                                    for (const scriptBlock of hydrateMatches) {
+                                        try {
+                                            const cleanJson = scriptBlock.replace(/<script[^>]*>|<\/script>/g, '').trim();
+                                            const payload = JSON.parse(cleanJson);
 
-                                if (pageTitle && pageTitle.toUpperCase() !== 'IKEA') {
-                                    fetchedDetails[code] = { name: pageTitle, dimensions: dims };
+                                            // Format 1: Klasični "product"
+                                            if (payload && payload.product) {
+                                                const p = payload.product;
+                                                if (p.price && itemPrice === 0) itemPrice = p.price;
+                                                if (p.name && !pageTitle) pageTitle = `${p.name} ${p.description || p.typeName || ''}`.trim();
+                                                if (p.mediaList && p.mediaList.length > 0 && !imageUrl) {
+                                                    imageUrl = p.mediaList[0].content?.url || '';
+                                                }
 
-                                    // Spremi novo scrapano u DynamoDB
-                                    await docClient.send(new PutCommand({
-                                        TableName: TABLE_NAME,
-                                        Item: { PK: `ARTICLE#${code}`, SK: 'INFO', code: code, name: pageTitle, dimensions: dims, updatedAt: new Date().toISOString() }
-                                    })).catch(() => {});
-                                    continue;
+                                                // Logika za dimenzije A (packageMeasurements)
+                                                if (p.packageMeasurements && p.packageMeasurements.length > 0 && width === 0) {
+                                                    p.packageMeasurements.forEach(pkg => {
+                                                        width = Math.max(width, pkg.width?.value || 0);
+                                                        height = Math.max(height, pkg.height?.value || 0);
+                                                        length = Math.max(length, pkg.length?.value || 0);
+                                                        weight += (pkg.weight?.value || 0);
+                                                    });
+                                                }
+
+                                                // Logika za dimenzije B (packaging)
+                                                if (p.packaging && p.packaging.packages && width === 0) {
+                                                    p.packaging.packages.forEach(pkg => {
+                                                        let qty = pkg.quantity?.value || 1;
+                                                        pkg.measurementGroups?.forEach(mg => {
+                                                            mg.measurements?.forEach(m => {
+                                                                if (m.type === 'width') width = Math.max(width, m.value);
+                                                                if (m.type === 'height') height = Math.max(height, m.value);
+                                                                if (m.type === 'length') length = Math.max(length, m.value);
+                                                                if (m.type === 'weight') weight += (m.value * qty);
+                                                            });
+                                                        });
+                                                    });
+                                                }
+                                            }
+
+                                            // Format 2: NextJS "pageProps.product"
+                                            if (payload && payload.pageProps && payload.pageProps.product) {
+                                                const p = payload.pageProps.product;
+                                                if (p.price && itemPrice === 0) itemPrice = p.price;
+                                                if (p.name && !pageTitle) pageTitle = `${p.name} ${p.description || p.typeName || ''}`.trim();
+
+                                                if (p.packaging && p.packaging.packages && width === 0) {
+                                                    p.packaging.packages.forEach(pkg => {
+                                                        let qty = pkg.quantity?.value || 1;
+                                                        pkg.measurementGroups?.forEach(mg => {
+                                                            mg.measurements?.forEach(m => {
+                                                                if (m.type === 'width') width = Math.max(width, m.value);
+                                                                if (m.type === 'height') height = Math.max(height, m.value);
+                                                                if (m.type === 'length') length = Math.max(length, m.value);
+                                                                if (m.type === 'weight') weight += (m.value * qty);
+                                                            });
+                                                        });
+                                                    });
+                                                }
+                                            }
+                                        } catch(err) {}
+                                    }
                                 }
+
+                                // Fallback ako nešto nije pronađeno
+                                if (itemPrice === 0) {
+                                    const prMatch = htmlText.match(/"product_prices":\s*\["([\d.]+)"\]/);
+                                    if (prMatch) itemPrice = parseFloat(prMatch[1]);
+                                }
+                                if (!pageTitle) {
+                                    const titleMatch = htmlText.match(/<title>([^<]+)<\/title>/i);
+                                    pageTitle = titleMatch ? titleMatch[1].replace(/- IKEA/i, '').trim() : `IKEA Artikl (${code})`;
+                                }
+                                if (!imageUrl) {
+                                    const imgMatch = htmlText.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i) || htmlText.match(/<meta[^>]*content="([^"]+)"[^>]*property="og:image"/i);
+                                    if (imgMatch) imageUrl = imgMatch[1];
+                                }
+                                if (width === 0 && length === 0 && weight === 0) {
+                                    const wMatch = htmlText.match(/Širina:\s*(\d+)\s*cm/i);
+                                    const hMatch = htmlText.match(/Visina:\s*(\d+)\s*cm/i);
+                                    const lMatch = htmlText.match(/Duljina:\s*(\d+)\s*cm/i);
+                                    const wtMatch = htmlText.match(/Težina:\s*([\d,.]+)\s*kg/i);
+
+                                    if (lMatch) length = parseInt(lMatch[1], 10);
+                                    if (wMatch) width = parseInt(wMatch[1], 10);
+                                    if (hMatch) height = parseInt(hMatch[1], 10);
+                                    if (wtMatch) weight = parseFloat(wtMatch[1].replace(',', '.'));
+                                    if (!length && width) length = width;
+                                }
+
+                                const dims = (width > 0 || length > 0 || weight > 0) ? { width, height, length, weight } : null;
+                                fetchedDetails[code] = { name: pageTitle, dimensions: dims, price: itemPrice, image: imageUrl };
+
+                                await docClient.send(new PutCommand({
+                                    TableName: TABLE_NAME,
+                                    Item: {
+                                        PK: `ARTICLE#${code}`,
+                                        SK: 'INFO',
+                                        code: code,
+                                        name: pageTitle,
+                                        dimensions: dims,
+                                        price: itemPrice,
+                                        image: imageUrl,
+                                        updatedAt: new Date().toISOString()
+                                    }
+                                })).catch(() => {});
+                                continue;
                             }
                         } catch (e) {}
-
-                        fetchedDetails[code] = { name: `IKEA Artikl (${code})`, dimensions: null };
+                        fetchedDetails[code] = { name: `IKEA Artikl (${code})`, dimensions: null, price: 0, image: '' };
                     }
                 }
 
-                // Spoji nazive
                 for (const [code, details] of Object.entries(fetchedDetails)) {
                     const item = itemsMap.get(code);
                     if (item) {
-                        item.name = item.isDesignPart ? `↳ [Dio dizajna] ${details.name}` : details.name;
+                        item.name = details.name;
                         item.dimensions = details.dimensions;
+                        item.price = details.price || 0;
+                        item.image = details.image || '';
                     }
                 }
 
@@ -317,7 +448,6 @@ app.post('/api/list-volume', async (req, res) => {
             }
         });
 
-        // 5. FINALNI IZRAČUN
         const finalParsedItems = Array.from(itemsMap.values());
         let totalItemsCount = 0, totalVolume = 0, totalWeight = 0, hasMissingDimensions = false;
 
@@ -339,7 +469,7 @@ app.post('/api/list-volume', async (req, res) => {
             }
         }
 
-        if (totalItemsCount > 15 || listUrl.toUpperCase().includes('PLATSA') || listUrl.toUpperCase().includes('PAX')) {
+        if (totalItemsCount > 15 || listUrl.value?.toUpperCase().includes('PLATSA') || listUrl.value?.toUpperCase().includes('PAX')) {
             requiresVan = true;
         }
 
@@ -362,5 +492,5 @@ app.post('/api/list-volume', async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => { console.log(`🚀 API pokrenut na portu ${PORT}`); });
