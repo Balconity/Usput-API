@@ -98,7 +98,7 @@ app.post('/api/list-volume', async (req, res) => {
 
         await browserQueue.add(async () => {
             let browser = await puppeteer.launch({
-                headless: false,
+                headless: "new",
                 args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1280,800']
             });
 
@@ -319,13 +319,11 @@ app.post('/api/list-volume', async (req, res) => {
                                 const hydrateMatches = htmlText.match(/<script[^>]*type="text\/hydrate"[^>]*>([\s\S]*?)<\/script>/g);
 
                                 if (hydrateMatches) {
-                                    // Prolazi kroz SVE JSON blokove dok ne prikupi sve potrebne podatke
                                     for (const scriptBlock of hydrateMatches) {
                                         try {
                                             const cleanJson = scriptBlock.replace(/<script[^>]*>|<\/script>/g, '').trim();
                                             const payload = JSON.parse(cleanJson);
 
-                                            // Format 1: Klasični "product"
                                             if (payload && payload.product) {
                                                 const p = payload.product;
                                                 if (p.price && itemPrice === 0) itemPrice = p.price;
@@ -334,7 +332,6 @@ app.post('/api/list-volume', async (req, res) => {
                                                     imageUrl = p.mediaList[0].content?.url || '';
                                                 }
 
-                                                // Logika za dimenzije A (packageMeasurements)
                                                 if (p.packageMeasurements && p.packageMeasurements.length > 0 && width === 0) {
                                                     p.packageMeasurements.forEach(pkg => {
                                                         width = Math.max(width, pkg.width?.value || 0);
@@ -344,7 +341,6 @@ app.post('/api/list-volume', async (req, res) => {
                                                     });
                                                 }
 
-                                                // Logika za dimenzije B (packaging)
                                                 if (p.packaging && p.packaging.packages && width === 0) {
                                                     p.packaging.packages.forEach(pkg => {
                                                         let qty = pkg.quantity?.value || 1;
@@ -360,7 +356,6 @@ app.post('/api/list-volume', async (req, res) => {
                                                 }
                                             }
 
-                                            // Format 2: NextJS "pageProps.product"
                                             if (payload && payload.pageProps && payload.pageProps.product) {
                                                 const p = payload.pageProps.product;
                                                 if (p.price && itemPrice === 0) itemPrice = p.price;
@@ -384,7 +379,6 @@ app.post('/api/list-volume', async (req, res) => {
                                     }
                                 }
 
-                                // Fallback ako nešto nije pronađeno
                                 if (itemPrice === 0) {
                                     const prMatch = htmlText.match(/"product_prices":\s*\["([\d.]+)"\]/);
                                     if (prMatch) itemPrice = parseFloat(prMatch[1]);
