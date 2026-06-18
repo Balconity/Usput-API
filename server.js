@@ -35,9 +35,9 @@ class TaskQueue {
     }
 }
 
-const browserQueue = new TaskQueue(2);
+// Povećano na 3 taba jer server sada ima 4GB RAM-a
+const browserQueue = new TaskQueue(3);
 
-// Baza linkova za planere (bez automatskog parametra na kraju kako bi se oponašao korisnik)
 const PLANNER_URLS = {
     'PLATSA': 'https://www.ikea.com/addon-app/storageone/platsa/web/latest/hr/hr/#/planner',
     'PAX': 'https://www.ikea.com/addon-app/storageone/pax/web/latest/hr/hr/#/planner',
@@ -60,7 +60,6 @@ app.post('/api/list-volume', async (req, res) => {
         console.log('\n--- NOVI ZAHTJEV ---', listUrl);
         const urlObj = new URL(listUrl);
 
-        // 1. Čupanje osnovnih proizvoda (receive-share i normalna košarica)
         if (listUrl.includes('/receive-share/')) {
             const pathSegments = urlObj.pathname.split('/');
             const shareIndex = pathSegments.indexOf('receive-share');
@@ -75,7 +74,6 @@ app.post('/api/list-volume', async (req, res) => {
             }
         }
 
-        // 2. Pronalazak dizajn kodova iz linka (npr. 32MFSK9:PLATSA:1)
         const generatedDesigns = [];
         const designsParam = urlObj.searchParams.get('designs');
         if (designsParam) {
@@ -107,18 +105,13 @@ app.post('/api/list-volume', async (req, res) => {
                 await page.setViewport({ width: 1280, height: 800 });
                 await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-                // --- A) SKENIRANJE GLAVNE LISTE (Kao pravi korisnik) ---
                 console.log(`[Glavna stranica] Učitavam ${listUrl}...`);
                 await page.goto(listUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-
-                // Pusti da se stranica do kraja renderira
                 await new Promise(r => setTimeout(r, 3000));
 
                 const scrapedListItems = await page.evaluate(() => {
                     const results = [];
-                    // Gledamo sav tekst na ekranu
                     const allText = document.body.innerText || '';
-                    // Traži šifre u formatu 123.456.78
                     const matches = [...allText.matchAll(/\b(\d{3}\.\d{3}\.\d{2})\b/g)];
                     matches.forEach(m => {
                         const code = m[1].replace(/\./g, '');
@@ -135,77 +128,88 @@ app.post('/api/list-volume', async (req, res) => {
                     }
                 }
 
-                // --- B) SKENIRANJE DIZAJNERA KAO PRAVI KORISNIK (Nema presretanja) ---
                 if (generatedDesigns.length > 0) {
                     for (const design of generatedDesigns) {
-                        console.log(`[Dizajner] Oponašam korisnika za: ${design.family} -> kod: ${design.code}`);
-
-                        // Odlazak na link
-                        await page.goto(design.link, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-
-                        // Čekamo 5 sekundi da React učita aplikaciju i WebGL
-                        await new Promise(r => setTimeout(r, 5000));
-
-                        // Pokušaj simulacije utipkavanja koda (ako se nije automatski učitalo)
                         try {
-                            const inputs = await page.$$('input[type="text"]');
-                            for (const input of inputs) {
-                                await input.click({ clickCount: 3 }); // Selektiraj postojeći tekst
-                                await input.type(design.code, { delay: 100 }); // Tipkaj slovo po slovo
-                                await page.keyboard.press('Enter');
-                            }
-                        } catch (e) {
-                            console.log("[Dizajner] Nema polja za unos, pretpostavljam da je dizajn učitan.");
-                        }
+                            console.log(`[Dizajner] Oponašam korisnika za: ${design.family} -> kod: ${design.code}`);
 
-                        // Čekamo još 5 sekundi da IKEA povuče podatke o tvom utipkanom kodu
-                        await new Promise(r => setTimeout(r, 5000));
+                            // PASIVNO PRISLUŠKIVANJE MREŽE - Slušamo JSON u letu!
+                            let networkCaughtItems = [];
 
-                        // Tražimo gumb za "Popis proizvoda" i klikamo ga
-                        await page.evaluate(() => {
-                            document.querySelectorAll('button, a').forEach(btn => {
-                                const txt = (btn.innerText || '').toLowerCase();
-                                if (txt.includes('popis') || txt.includes('proizvod') || txt.includes('artikli') || txt.includes('cijena') || txt.includes('nastavi')) {
-                                    try { btn.click(); } catch(e) {}
+                            const responseHandler = async (res) => {
+                                const req = res.request();
+                                if (req.resourceType() === 'fetch' || req.resourceType() === 'xhr') {
+                                    try {
+                                        const json = await res.json();
+
+                                        // Rekurzivna funkcija koja traži bilo koji ključ s artiklima
+                                        const extractCodes = (obj) => {
+                                            if (!obj || typeof obj !== 'object') return;
+
+                                            const code = obj.articleNumber || obj.itemNo || obj.articleNo || obj.itemNumber || obj.partNumber || obj.id || obj.articleCode || obj.productId;
+                                            const qty = obj.quantity !== undefined ? obj.quantity : (obj.qty !== undefined ? obj.qty : obj.count);
+
+                                            if (code !== undefined && qty !== undefined) {
+                                                const cleanCode = String(code).replace(/\D/g, '');
+                                                // IKEA kodovi su uvijek 8 znamenki kad se maknu točke
+                                                if (cleanCode.length >= 6 && cleanCode.length <= 10) {
+                                                    networkCaughtItems.push({ code: cleanCode, quantity: parseInt(qty, 10) || 1 });
+                                                }
+                                            }
+
+                                            for (const key in obj) {
+                                                if (Object.prototype.hasOwnProperty.call(obj, key)) extractCodes(obj[key]);
+                                            }
+                                        };
+                                        extractCodes(json);
+                                    } catch (e) {
+                                        // Prazni odgovori se ignoriraju
+                                    }
+                                }
+                            };
+
+                            // Uključujemo slušalicu
+                            page.on('response', responseHandler);
+
+                            // Odlazimo na dizajn link i čekamo
+                            await page.goto(design.link, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+                            await new Promise(r => setTimeout(r, 8000));
+
+                            // Klik na "Prihvati kolačiće" ako smeta na ekranu
+                            await page.evaluate(() => {
+                                const cookieBtn = document.querySelector('#onetrust-accept-btn-handler');
+                                if (cookieBtn) cookieBtn.click();
+                            });
+
+                            // Gasimo slušalicu da ne opterećujemo memoriju
+                            page.off('response', responseHandler);
+
+                            console.log(`[Dizajner] Preko mreže "u letu" ulovljeno ${networkCaughtItems.length} artikala.`);
+
+                            // Dodajemo ulovljene dizajn artikle na našu glavnu listu
+                            networkCaughtItems.forEach(item => {
+                                const finalQty = item.quantity * design.qty;
+                                if (itemsMap.has(item.code)) {
+                                    // Povećavamo samo ako je dizajn donio veću količinu ili zbrajamo
+                                    itemsMap.get(item.code).quantity += finalQty;
+                                } else {
+                                    itemsMap.set(item.code, {
+                                        code: item.code,
+                                        name: 'Dio dizajna',
+                                        quantity: finalQty,
+                                        dimensions: null,
+                                        isDesignPart: true
+                                    });
                                 }
                             });
-                        });
 
-                        // Čekamo 3 sekunde da se otvori bočni izbornik/prozor
-                        await new Promise(r => setTimeout(r, 3000));
-
-                        // Skupit ćemo SVE IKEA šifre koje su trenutno napisane na ekranu
-                        const plannerCodes = await page.evaluate(() => {
-                            const codes = [];
-                            const allText = document.body.innerText || '';
-                            const matches = [...allText.matchAll(/\b(\d{3}\.\d{3}\.\d{2})\b/g)];
-                            matches.forEach(m => {
-                                const cleanCode = m[1].replace(/\./g, '');
-                                codes.push(cleanCode);
-                            });
-                            return [...new Set(codes)]; // Samo unikatni kodovi
-                        });
-
-                        console.log(`[Dizajner] Na ekranu prepoznato ${plannerCodes.length} različitih artikala.`);
-
-                        // Dodavanje u glavnu listu
-                        plannerCodes.forEach(code => {
-                            if (itemsMap.has(code)) {
-                                itemsMap.get(code).quantity += design.qty;
-                            } else {
-                                itemsMap.set(code, {
-                                    code: code,
-                                    name: 'Dio dizajna',
-                                    quantity: design.qty,
-                                    dimensions: null,
-                                    isDesignPart: true
-                                });
-                            }
-                        });
+                        } catch (plannerErr) {
+                            console.error(`[Dizajner] Greška pri obradi dizajna, ignoriram: ${plannerErr.message}`);
+                        }
                     }
                 }
 
-                // --- C) DOHVAĆANJE DIMENZIJA I IMENA (DynamoDB / Fetch) ---
+                // --- BAZA PODATAKA (DynamoDB / Fetch) ---
                 const allCodes = Array.from(itemsMap.values()).map(i => i.code);
                 const missingCodesToFetch = [];
                 const fetchedDetails = {};
@@ -222,7 +226,7 @@ app.post('/api/list-volume', async (req, res) => {
                 }
 
                 if (missingCodesToFetch.length > 0) {
-                    console.log(`[Server] Skidam dimenzije s IKEA weba za ${missingCodesToFetch.length} novih komada...`);
+                    console.log(`[Server] Skidam podatke za ${missingCodesToFetch.length} novih komada...`);
                     for (const code of missingCodesToFetch) {
                         try {
                             const response = await fetch(`https://www.ikea.com/hr/hr/p/-${code}/`, {
@@ -259,12 +263,11 @@ app.post('/api/list-volume', async (req, res) => {
                             }
                         } catch (e) {}
 
-                        // Ako ne uspije skinuti, artikl i dalje mora biti prikazan klijentu!
                         fetchedDetails[code] = { name: `IKEA Artikl (${code})`, dimensions: null };
                     }
                 }
 
-                // --- SPAJANJE PODATAKA ZA FRONTEND ---
+                // --- SPAJANJE PODATAKA ---
                 for (const [code, details] of Object.entries(fetchedDetails)) {
                     const item = itemsMap.get(code);
                     if (item) {
@@ -296,7 +299,7 @@ app.post('/api/list-volume', async (req, res) => {
                 if (weight) totalWeight += weight * item.quantity;
                 else hasMissingDimensions = true;
             } else {
-                hasMissingDimensions = true; // Ako fale podaci
+                hasMissingDimensions = true;
             }
         }
 
@@ -318,7 +321,7 @@ app.post('/api/list-volume', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Greška:', error.message);
+        console.error('Kritična greška:', error.message);
         res.status(500).json({ success: false, error: 'Greška prilikom obrade IKEA liste.' });
     }
 });
