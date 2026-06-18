@@ -463,7 +463,7 @@ app.post('/api/list-volume', async (req, res) => {
             }
         }
 
-        if (totalItemsCount > 15 || listUrl.value?.toUpperCase().includes('PLATSA') || listUrl.value?.toUpperCase().includes('PAX')) {
+        if (totalItemsCount > 15 || listUrl.toUpperCase().includes('PLATSA') || listUrl.toUpperCase().includes('PAX')) {
             requiresVan = true;
         }
 
