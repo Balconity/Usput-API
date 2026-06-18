@@ -9,10 +9,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ============================================================================
+// 1. DYNAMODB KONFIGURACIJA
+// ============================================================================
 const client = new DynamoDBClient({ region: "eu-central-1" });
 const docClient = DynamoDBDocumentClient.from(client);
 const TABLE_NAME = "Usput";
 
+// ============================================================================
+// 2. SUSTAV ZA RED ČEKANJA (QUEUE)
+// ============================================================================
 class TaskQueue {
     constructor(concurrency) {
         this.concurrency = concurrency;
@@ -37,6 +43,7 @@ class TaskQueue {
     }
 }
 
+// Ograničavamo na 2 taba istovremeno zbog 2GB RAM-a na t3.small
 const browserQueue = new TaskQueue(2);
 
 const PLANNER_URLS = {
@@ -47,13 +54,18 @@ const PLANNER_URLS = {
     'METOD': 'https://kitchen.planner.ikea.com/hr/hr/?project='
 };
 
+// Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', message: 'Usput Puppeteer API radi savršeno!' });
 });
 
+// ============================================================================
+// 3. GLAVNA API FUNKCIJA
+// ============================================================================
 app.post('/api/list-volume', async (req, res) => {
     try {
         const listUrl = req.body.url;
+
         if (!listUrl || !listUrl.includes('ikea.com')) {
             return res.status(400).json({ success: false, error: 'Molimo unesite ispravnu IKEA poveznicu.' });
         }
@@ -65,7 +77,7 @@ app.post('/api/list-volume', async (req, res) => {
         console.log('\n--- NOVI ZAHTJEV ZAPRIMLJEN ---', listUrl);
         const urlObj = new URL(listUrl);
 
-        // 1. POPRAVAK: Izvlačenje artikala iz path-a ako je prisutan /receive-share/
+        // 1. Izvlačenje osnovnih artikala s liste (iz URL path-a)
         if (listUrl.includes('/receive-share/')) {
             const pathSegments = urlObj.pathname.split('/');
             const shareIndex = pathSegments.indexOf('receive-share');
@@ -80,7 +92,7 @@ app.post('/api/list-volume', async (req, res) => {
             }
         }
 
-        // 2. POPRAVAK: Globalno izvlačenje SVIH dizajnera iz query parametara (podržava više dizajnera odjednom)
+        // 2. Globalno izvlačenje dizajnera iz parametara (Sada u potpunosti hvata PLATSA, PAX itd.)
         const generatedDesigns = [];
         const designsParam = urlObj.searchParams.get('designs');
         if (designsParam) {
@@ -109,7 +121,7 @@ app.post('/api/list-volume', async (req, res) => {
                 const page = await browser.newPage();
                 await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
 
-                // Skeniranje glavne liste artikala
+                // A) SKENIRANJE GLAVNE STRANICE
                 await page.goto(listUrl, { waitUntil: 'networkidle2', timeout: 30000 });
                 const scrapedListItems = await page.evaluate(() => {
                     const results = [];
@@ -139,52 +151,64 @@ app.post('/api/list-volume', async (req, res) => {
                     }
                 }
 
-                // 3. POPRAVAK: Prolazak kroz SVE detektirane dizajnere sekvencijalno
+                // B) SKENIRANJE DIZAJNERA (PLATSA, PAX...) BEZ CORS BLOKADA
                 if (generatedDesigns.length > 0) {
                     await page.setRequestInterception(true);
                     page.on('request', req => req.continue());
 
                     for (const design of generatedDesigns) {
-                        console.log(`[Dizajner] Pokrećem skeniranje pod-dizajna: ${design.link}`);
+                        console.log(`[Dizajner] Učitavam dizajn: ${design.link}`);
 
-                        page.removeAllListeners('response'); // Očisti stare listenere za ovaj krug
+                        page.removeAllListeners('response'); // Očisti stare slušače
                         page.on('response', async res => {
                             const req = res.request();
-                            if ((req.resourceType() === 'fetch' || req.resourceType() === 'xhr') && res.url().includes('ikea.com')) {
+
+                            // POPRAVAK: Maknuli smo uvjet "includes('ikea.com')" jer API može biti na ingka.com
+                            if (req.resourceType() === 'fetch' || req.resourceType() === 'xhr') {
                                 try {
                                     const json = await res.json();
+
+                                    // Rekurzivno izvlačenje šifri
                                     const extractCodes = (obj) => {
                                         if (!obj || typeof obj !== 'object') return;
-                                        const code = obj.articleNumber || obj.itemNo || obj.id || obj.partNumber;
-                                        const qty = obj.quantity || obj.qty || obj.count;
 
-                                        if (code && qty !== undefined && typeof code === 'string') {
-                                            const cleanCode = code.replace(/\D/g, '');
-                                            if (cleanCode.length === 8) { // IKEA šifre imaju točno 8 znamenki kad se očiste
+                                        // Gleda sve moguće ključeve koje IKEA koristi
+                                        const code = obj.articleNumber || obj.itemNo || obj.articleNo || obj.itemNumber || obj.partNumber || obj.id;
+                                        const qty = obj.quantity !== undefined ? obj.quantity : (obj.qty !== undefined ? obj.qty : obj.count);
+
+                                        if (code !== undefined && qty !== undefined) {
+                                            // POPRAVAK: Pretvaramo u String u slučaju da je šifra došla kao INT broj
+                                            const cleanCode = String(code).replace(/\D/g, '');
+
+                                            // IKEA šifre imaju 8 znamenki, ali za svaki slučaj puštamo 6-10
+                                            if (cleanCode.length >= 6 && cleanCode.length <= 10) {
                                                 const finalQty = (parseInt(qty, 10) || 1) * design.qty;
                                                 if (itemsMap.has(cleanCode)) {
-                                                    // Ovdje koristimo Math.max ili += ovisno o IKEA JSON strukturi, max je sigurniji od dupliranja
                                                     itemsMap.get(cleanCode).quantity = Math.max(itemsMap.get(cleanCode).quantity, finalQty);
                                                 } else {
                                                     itemsMap.set(cleanCode, { code: cleanCode, name: 'Učitavam...', quantity: finalQty, dimensions: null, isDesignPart: true });
                                                 }
                                             }
                                         }
+
                                         for (const key in obj) {
                                             if (Object.prototype.hasOwnProperty.call(obj, key)) extractCodes(obj[key]);
                                         }
                                     };
                                     extractCodes(json);
-                                } catch(e) {}
+                                } catch(e) {
+                                    // Ignoriramo datoteke koje nisu JSON
+                                }
                             }
                         });
 
-                        await page.goto(design.link, { waitUntil: 'networkidle0', timeout: 30000 }).catch(e => console.log("Timeout ili manja greška pri goto planera, nastavljam..."));
+                        // Idemo na planer, čak i ako padne timeout uhvatit ćemo JSON u letu
+                        await page.goto(design.link, { waitUntil: 'networkidle0', timeout: 30000 }).catch(e => console.log("Planer se duže učitava, nastavljam..."));
                     }
                     await page.setRequestInterception(false);
                 }
 
-                // Provjera baze podataka za keširane artikle
+                // C) PROVJERA Baze Podataka (DynamoDB)
                 const allCodes = Array.from(itemsMap.values()).map(i => i.code);
                 const missingCodesToFetch = [];
                 const fetchedDetails = {};
@@ -195,6 +219,7 @@ app.post('/api/list-volume', async (req, res) => {
                             TableName: TABLE_NAME,
                             Key: { PK: `ARTICLE#${code}`, SK: 'INFO' }
                         }));
+
                         if (dbResponse.Item && dbResponse.Item.name) {
                             fetchedDetails[code] = dbResponse.Item;
                         } else {
@@ -205,23 +230,25 @@ app.post('/api/list-volume', async (req, res) => {
                     }
                 }
 
-                // 4. POPRAVAK: Izbacivanje fetcha iz browsera na čist Node.js (Rješava CORS problem 100%)
+                // D) ČUPANJE DIMENZIJA ZA NOVE ARTIKLE PREKO NODE FETCH-a (Ultra brzo, bez DOM-a)
                 if (missingCodesToFetch.length > 0) {
-                    console.log(`[Server Fetch] Grebem s weba ${missingCodesToFetch.length} novih artikala bez CORS blokade...`);
+                    console.log(`[Server] Skidam dimenzije za ${missingCodesToFetch.length} novih artikala...`);
 
                     for (const code of missingCodesToFetch) {
                         try {
                             const response = await fetch(`https://www.ikea.com/hr/hr/p/-${code}/`, {
                                 headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
                             });
+
                             if (response.ok) {
                                 const htmlText = await response.text();
 
+                                // Brzo Regex izvlačenje naslova
                                 const titleMatch = htmlText.match(/<title>([^<]+)<\/title>/i);
                                 let pageTitle = titleMatch ? titleMatch[1] : '';
-                                pageTitle = pageTitle.replace(/- IKEA/i, '').trim();
-                                pageTitle = pageTitle.split(',')[0].trim();
+                                pageTitle = pageTitle.replace(/- IKEA/i, '').trim().split(',')[0].trim();
 
+                                // Regex izvlačenje dimenzija
                                 let width = 0, height = 0, length = 0, weight = 0;
                                 const wMatch = htmlText.match(/Širina:\s*(\d+)\s*cm/i);
                                 const hMatch = htmlText.match(/Visina:\s*(\d+)\s*cm/i);
@@ -233,7 +260,7 @@ app.post('/api/list-volume', async (req, res) => {
                                 if (hMatch) height = parseInt(hMatch[1], 10);
                                 if (wtMatch) weight = parseFloat(wtMatch[1].replace(',', '.'));
 
-                                if (!length && width) length = width; // Fallback sigurnost
+                                if (!length && width) length = width;
 
                                 const dims = (width > 0 || length > 0 || weight > 0) ? { width, height, length, weight } : null;
 
@@ -241,25 +268,25 @@ app.post('/api/list-volume', async (req, res) => {
                                     const details = { name: pageTitle, dimensions: dims };
                                     fetchedDetails[code] = details;
 
-                                    // Spremi u DynamoDB za idući put
+                                    // Spremi u bazu za idući put
                                     await docClient.send(new PutCommand({
                                         TableName: TABLE_NAME,
                                         Item: {
                                             PK: `ARTICLE#${code}`, SK: 'INFO',
-                                            code, name: pageTitle, dimensions: dims, updatedAt: new Date().toISOString()
+                                            code: code, name: pageTitle, dimensions: dims, updatedAt: new Date().toISOString()
                                         }
-                                    })).catch(e => {});
+                                    })).catch(e => console.log("DB Put Error:", e.message));
                                     continue;
                                 }
                             }
-                        } catch (e) {
-                            console.error(`Greška za artikl ${code}:`, e.message);
-                        }
+                        } catch (e) {}
+
+                        // Fallback ako ne uspije pronaći artikl na webu
                         fetchedDetails[code] = { name: `IKEA Artikl (${code})`, dimensions: null };
                     }
                 }
 
-                // Mapiranje spojenih rezultata natrag u mapu artikala
+                // Spajanje svih imena i dimenzija
                 for (const [code, details] of Object.entries(fetchedDetails)) {
                     const item = itemsMap.get(code);
                     if (item) {
@@ -273,25 +300,39 @@ app.post('/api/list-volume', async (req, res) => {
             }
         });
 
-        // Finalna kalkulacija volumena i težine
+        // 4. FINALNI IZRAČUN (Volumen i Kilaža)
         const finalParsedItems = Array.from(itemsMap.values());
-        let totalItemsCount = 0, totalVolume = 0, totalWeight = 0, hasMissingDimensions = false;
+        let totalItemsCount = 0;
+        let totalVolume = 0;
+        let totalWeight = 0;
+        let hasMissingDimensions = false;
 
         for (const item of finalParsedItems) {
             totalItemsCount += item.quantity;
+
             if (item.dimensions) {
                 const { length, width, height, weight } = item.dimensions;
+
                 if (length > 170 || weight > 30) {
                     requiresVan = true;
                     const cleanName = item.name.replace('↳ [Dio dizajna] ', '');
                     foundBigItems.add(`${cleanName} (${length}cm / ${weight}kg)`);
                 }
+
                 if (length && width && height) {
                     totalVolume += ((length * width * height) / 1000000) * item.quantity;
-                } else { hasMissingDimensions = true; }
-                if (weight) { totalWeight += weight * item.quantity; }
-                else { hasMissingDimensions = true; }
-            } else { hasMissingDimensions = true; }
+                } else {
+                    hasMissingDimensions = true;
+                }
+
+                if (weight) {
+                    totalWeight += (weight * item.quantity);
+                } else {
+                    hasMissingDimensions = true;
+                }
+            } else {
+                hasMissingDimensions = true;
+            }
         }
 
         if (totalItemsCount > 15 || listUrl.toUpperCase().includes('PLATSA') || listUrl.toUpperCase().includes('PAX')) {
@@ -305,7 +346,7 @@ app.post('/api/list-volume', async (req, res) => {
                 parsedItems: finalParsedItems,
                 foundBigItems: Array.from(foundBigItems),
                 requiresVan: requiresVan,
-                designLink: generatedDesigns.length > 0 ? generatedDesigns[0].link : null, // Vraćamo link prvog dizajnera za frontend ako treba
+                designLink: generatedDesigns.length > 0 ? generatedDesigns[0].link : null,
                 totalVolume: Number(totalVolume.toFixed(3)),
                 totalWeight: Number(totalWeight.toFixed(2)),
                 hasMissingDimensions: hasMissingDimensions
