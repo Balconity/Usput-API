@@ -92,7 +92,7 @@ app.post('/api/list-volume', async (req, res) => {
             }
         }
 
-        // 2. Globalno izvlačenje dizajnera iz parametara (Sada u potpunosti hvata PLATSA, PAX itd.)
+        // 2. Globalno izvlačenje dizajnera iz parametara
         const generatedDesigns = [];
         const designsParam = urlObj.searchParams.get('designs');
         if (designsParam) {
@@ -151,36 +151,31 @@ app.post('/api/list-volume', async (req, res) => {
                     }
                 }
 
-                // B) SKENIRANJE DIZAJNERA (PLATSA, PAX...) BEZ CORS BLOKADA
+                // B) SKENIRANJE DIZAJNERA (Sada ultra pouzdano)
                 if (generatedDesigns.length > 0) {
-                    await page.setRequestInterception(true);
-                    page.on('request', req => req.continue());
-
                     for (const design of generatedDesigns) {
                         console.log(`[Dizajner] Učitavam dizajn: ${design.link}`);
 
-                        page.removeAllListeners('response'); // Očisti stare slušače
+                        page.removeAllListeners('response');
                         page.on('response', async res => {
                             const req = res.request();
 
-                            // POPRAVAK: Maknuli smo uvjet "includes('ikea.com')" jer API može biti na ingka.com
                             if (req.resourceType() === 'fetch' || req.resourceType() === 'xhr') {
+                                // Preskakanje preflight CORS zahtjeva
+                                if (res.status() === 204 || res.status() === 202) return;
+
                                 try {
                                     const json = await res.json();
 
-                                    // Rekurzivno izvlačenje šifri
                                     const extractCodes = (obj) => {
                                         if (!obj || typeof obj !== 'object') return;
 
-                                        // Gleda sve moguće ključeve koje IKEA koristi
-                                        const code = obj.articleNumber || obj.itemNo || obj.articleNo || obj.itemNumber || obj.partNumber || obj.id;
+                                        // POPRAVAK: Svi mogući IKEA ključevi za proizvode (uključujući articleCode)
+                                        const code = obj.articleNumber || obj.itemNo || obj.articleNo || obj.itemNumber || obj.partNumber || obj.id || obj.articleCode || obj.itemCode || obj.productId;
                                         const qty = obj.quantity !== undefined ? obj.quantity : (obj.qty !== undefined ? obj.qty : obj.count);
 
                                         if (code !== undefined && qty !== undefined) {
-                                            // POPRAVAK: Pretvaramo u String u slučaju da je šifra došla kao INT broj
                                             const cleanCode = String(code).replace(/\D/g, '');
-
-                                            // IKEA šifre imaju 8 znamenki, ali za svaki slučaj puštamo 6-10
                                             if (cleanCode.length >= 6 && cleanCode.length <= 10) {
                                                 const finalQty = (parseInt(qty, 10) || 1) * design.qty;
                                                 if (itemsMap.has(cleanCode)) {
@@ -197,15 +192,18 @@ app.post('/api/list-volume', async (req, res) => {
                                     };
                                     extractCodes(json);
                                 } catch(e) {
-                                    // Ignoriramo datoteke koje nisu JSON
+                                    // Prazni ili ne-JSON odgovori se ignoriraju
                                 }
                             }
                         });
 
-                        // Idemo na planer, čak i ako padne timeout uhvatit ćemo JSON u letu
-                        await page.goto(design.link, { waitUntil: 'networkidle0', timeout: 30000 }).catch(e => console.log("Planer se duže učitava, nastavljam..."));
+                        // Cekamo samo da se učita kostur stranice (DOMContentLoaded)
+                        await page.goto(design.link, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(e => console.log("Timeout planera, nastavljam..."));
+
+                        // OBAVEZNO: Dajemo 4 sekunde vremena API-ju da pošalje i primi JSON u pozadini
+                        console.log(`[Dizajner] Čekam 4 sekunde da se povuku svi proizvodi iz planera...`);
+                        await new Promise(resolve => setTimeout(resolve, 4000));
                     }
-                    await page.setRequestInterception(false);
                 }
 
                 // C) PROVJERA Baze Podataka (DynamoDB)
@@ -230,7 +228,7 @@ app.post('/api/list-volume', async (req, res) => {
                     }
                 }
 
-                // D) ČUPANJE DIMENZIJA ZA NOVE ARTIKLE PREKO NODE FETCH-a (Ultra brzo, bez DOM-a)
+                // D) ČUPANJE DIMENZIJA ZA NOVE ARTIKLE PREKO NODE FETCH-a
                 if (missingCodesToFetch.length > 0) {
                     console.log(`[Server] Skidam dimenzije za ${missingCodesToFetch.length} novih artikala...`);
 
@@ -243,12 +241,10 @@ app.post('/api/list-volume', async (req, res) => {
                             if (response.ok) {
                                 const htmlText = await response.text();
 
-                                // Brzo Regex izvlačenje naslova
                                 const titleMatch = htmlText.match(/<title>([^<]+)<\/title>/i);
                                 let pageTitle = titleMatch ? titleMatch[1] : '';
                                 pageTitle = pageTitle.replace(/- IKEA/i, '').trim().split(',')[0].trim();
 
-                                // Regex izvlačenje dimenzija
                                 let width = 0, height = 0, length = 0, weight = 0;
                                 const wMatch = htmlText.match(/Širina:\s*(\d+)\s*cm/i);
                                 const hMatch = htmlText.match(/Visina:\s*(\d+)\s*cm/i);
@@ -268,7 +264,6 @@ app.post('/api/list-volume', async (req, res) => {
                                     const details = { name: pageTitle, dimensions: dims };
                                     fetchedDetails[code] = details;
 
-                                    // Spremi u bazu za idući put
                                     await docClient.send(new PutCommand({
                                         TableName: TABLE_NAME,
                                         Item: {
@@ -281,7 +276,6 @@ app.post('/api/list-volume', async (req, res) => {
                             }
                         } catch (e) {}
 
-                        // Fallback ako ne uspije pronaći artikl na webu
                         fetchedDetails[code] = { name: `IKEA Artikl (${code})`, dimensions: null };
                     }
                 }
